@@ -45,6 +45,8 @@ def init_db():
                 type TEXT NOT NULL,
                 file_id TEXT NOT NULL,
                 desc TEXT NOT NULL,
+                parent_code TEXT,
+                views INTEGER DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -60,7 +62,18 @@ def init_db():
             )
             """
         )
+    ensure_movie_columns()
     migrate_legacy_json()
+
+
+def ensure_movie_columns():
+    with get_db() as conn:
+        rows = conn.execute("PRAGMA table_info(movies)").fetchall()
+        columns = {row["name"] for row in rows}
+        if "parent_code" not in columns:
+            conn.execute("ALTER TABLE movies ADD COLUMN parent_code TEXT")
+        if "views" not in columns:
+            conn.execute("ALTER TABLE movies ADD COLUMN views INTEGER DEFAULT 0")
 
 
 def migrate_legacy_json():
@@ -72,14 +85,16 @@ def migrate_legacy_json():
                 for code, movie in data.items():
                     conn.execute(
                         """
-                        INSERT OR IGNORE INTO movies (code, type, file_id, desc)
-                        VALUES (?, ?, ?, ?)
+                        INSERT OR IGNORE INTO movies (code, type, file_id, desc, parent_code, views)
+                        VALUES (?, ?, ?, ?, ?, ?)
                         """,
                         (
                             str(code).upper(),
                             movie.get("type", "text"),
                             movie.get("file_id", ""),
                             movie.get("desc", ""),
+                            movie.get("parent_code"),
+                            movie.get("views", 0),
                         ),
                     )
             logger.info("movies.json dan ma'lumotlar ko'chirildi.")
@@ -163,20 +178,20 @@ def get_all_user_ids():
 def get_movie(code):
     with get_db() as conn:
         row = conn.execute(
-            "SELECT code, type, file_id, desc FROM movies WHERE code = ?",
+            "SELECT code, type, file_id, desc, parent_code, views FROM movies WHERE code = ?",
             (code,),
         ).fetchone()
     return dict(row) if row else None
 
 
-def add_movie(code, content_type, file_id, desc):
+def add_movie(code, content_type, file_id, desc, parent_code=None):
     with get_db() as conn:
         conn.execute(
             """
-            INSERT INTO movies (code, type, file_id, desc)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO movies (code, type, file_id, desc, parent_code)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (code, content_type, file_id, desc),
+            (code, content_type, file_id, desc, parent_code),
         )
 
 
@@ -189,7 +204,7 @@ def delete_movie(code):
 def list_movies():
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT code, desc, type FROM movies ORDER BY code"
+            "SELECT code, desc, type, views, parent_code FROM movies ORDER BY code"
         ).fetchall()
     return rows
 
@@ -204,12 +219,45 @@ def movie_stats():
     return total, counts
 
 
+def get_random_movies(limit=15):
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT code, desc, views FROM movies ORDER BY RANDOM() LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return rows
+
+
+def get_children(parent_code):
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT code, desc, views FROM movies
+            WHERE parent_code = ?
+            ORDER BY code
+            """,
+            (parent_code,),
+        ).fetchall()
+    return rows
+
+
+def increment_views(code):
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE movies SET views = COALESCE(views, 0) + 1 WHERE code = ?",
+            (code,),
+        )
+
+
 def main_menu_keyboard():
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Kino qidirish", callback_data="search_movie"),
-                InlineKeyboardButton("Admin bilan bog'lanish", callback_data="contact_admin"),
+                InlineKeyboardButton("🔍 Kino qidirish", callback_data="search_movie"),
+                InlineKeyboardButton("📞 Admin", callback_data="contact_admin"),
+            ],
+            [
+                InlineKeyboardButton("🎲 Tasodifiy kinolar", callback_data="random_movies"),
             ],
         ]
     )
@@ -219,15 +267,15 @@ def admin_panel_keyboard():
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Kino qo'shish", callback_data="add_movie"),
-                InlineKeyboardButton("Kino o'chirish", callback_data="delete_movie"),
+                InlineKeyboardButton("➕ Kino qo'shish", callback_data="add_movie"),
+                InlineKeyboardButton("🗑 Kino o'chirish", callback_data="delete_movie"),
             ],
             [
-                InlineKeyboardButton("Kinolar ro'yxati", callback_data="list_movies"),
-                InlineKeyboardButton("Statistika", callback_data="admin_stats"),
+                InlineKeyboardButton("📋 Kinolar ro'yxati", callback_data="list_movies"),
+                InlineKeyboardButton("📊 Statistika", callback_data="admin_stats"),
             ],
-            [InlineKeyboardButton("Broadcast", callback_data="broadcast")],
-            [InlineKeyboardButton("Bosh menyu", callback_data="main_menu")],
+            [InlineKeyboardButton("📢 Xabar yuborish", callback_data="broadcast")],
+            [InlineKeyboardButton("🏠 Bosh menyu", callback_data="main_menu")],
         ]
     )
 
@@ -236,21 +284,35 @@ def not_found_keyboard():
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Boshqa kod", callback_data="search_movie"),
-                InlineKeyboardButton("Admin bilan bog'lanish", callback_data="contact_admin"),
+                InlineKeyboardButton("🔍 Boshqa kod", callback_data="search_movie"),
+                InlineKeyboardButton("📞 Admin", callback_data="contact_admin"),
             ],
-            [InlineKeyboardButton("Bosh menyu", callback_data="main_menu")],
+            [InlineKeyboardButton("🏠 Bosh menyu", callback_data="main_menu")],
         ]
     )
+
+
+def numbered_keyboard(items, prefix="pick"):
+    buttons = []
+    row = []
+    for idx, item in enumerate(items, start=1):
+        row.append(InlineKeyboardButton(str(idx), callback_data=f"{prefix}_{item['code']}"))
+        if idx % 5 == 0:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("🏠 Bosh menyu", callback_data="main_menu")])
+    return InlineKeyboardMarkup(buttons)
 
 
 def force_sub_keyboard():
     buttons = []
     link = get_channel_link()
     if link:
-        buttons.append([InlineKeyboardButton("Kanalga a'zo bo'lish", url=link)])
-    buttons.append([InlineKeyboardButton("Tekshirish", callback_data="check_sub")])
-    buttons.append([InlineKeyboardButton("Bosh menyu", callback_data="main_menu")])
+        buttons.append([InlineKeyboardButton("📢 Kanalga a'zo bo'lish", url=link)])
+    buttons.append([InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub")])
+    buttons.append([InlineKeyboardButton("🏠 Bosh menyu", callback_data="main_menu")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -278,8 +340,8 @@ async def is_user_subscribed(user_id, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
     text = (
-        "Salom! Xush kelibsiz.\n\n"
-        "Kino yoki video topish uchun kod yuboring yoki menyudan foydalaning."
+        "🎬 Salom! Kino botiga xush kelibsiz.\n\n"
+        "📝 Kino kodini yuboring yoki quyidagi menyudan foydalaning."
     )
     await update.message.reply_text(
         text, reply_markup=main_menu_keyboard()
@@ -290,24 +352,24 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
     if not ADMIN_CODE:
         await update.message.reply_text(
-            "ADMIN_CODE sozlanmagan. .env faylini tekshiring."
+            "⚠️ ADMIN_CODE sozlanmagan. .env faylini tekshiring."
         )
         return
 
     if len(context.args) == 0:
         context.user_data["awaiting_admin_code"] = True
-        await update.message.reply_text("Admin kodini kiriting:")
+        await update.message.reply_text("🔐 Admin kodini kiriting:")
         return
 
     code = context.args[0]
     if code == ADMIN_CODE:
         set_admin(update.effective_user.id)
         await update.message.reply_text(
-            "Admin paneli:", reply_markup=admin_panel_keyboard()
+            "✅ Admin paneli:", reply_markup=admin_panel_keyboard()
         )
     else:
         await notify_admin_attempt(update, context, code)
-        await update.message.reply_text("Noto'g'ri admin kodi!")
+        await update.message.reply_text("❌ Noto'g'ri admin kodi!")
 
 
 async def notify_admin_attempt(update: Update, context: ContextTypes.DEFAULT_TYPE, code):
@@ -320,12 +382,12 @@ async def notify_admin_attempt(update: Update, context: ContextTypes.DEFAULT_TYP
             await context.bot.send_message(
                 admin_id,
                 (
-                    "Ogohlantirish!\n\n"
-                    "Foydalanuvchi admin paneliga kirishga urindi:\n"
-                    f"Ism: {user.first_name}\n"
-                    f"ID: {user.id}\n"
-                    f"Username: @{user.username if user.username else 'mavjud emas'}\n"
-                    f"Kiritilgan kod: {code}"
+                    "⚠️ Ogohlantirish!\n\n"
+                    "❌ Foydalanuvchi admin paneliga kirishga urindi:\n"
+                    f"👤 Ism: {user.first_name}\n"
+                    f"🆔 ID: {user.id}\n"
+                    f"📱 Username: @{user.username if user.username else 'mavjud emas'}\n"
+                    f"🔑 Kiritilgan kod: {code}"
                 ),
             )
         except Exception as exc:
@@ -338,11 +400,11 @@ async def handle_admin_login(update: Update, context: ContextTypes.DEFAULT_TYPE)
         set_admin(update.effective_user.id)
         context.user_data["awaiting_admin_code"] = False
         await update.message.reply_text(
-            "Admin paneli:", reply_markup=admin_panel_keyboard()
+            "✅ Admin paneli:", reply_markup=admin_panel_keyboard()
         )
     else:
         await notify_admin_attempt(update, context, code)
-        await update.message.reply_text("Noto'g'ri admin kodi!")
+        await update.message.reply_text("❌ Noto'g'ri admin kodi!")
 
 
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -350,14 +412,14 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     upsert_user(query.from_user)
     await query.edit_message_text(
-        "Bosh menyu:", reply_markup=main_menu_keyboard()
+        "🏠 Bosh menyu:", reply_markup=main_menu_keyboard()
     )
 
 
 async def search_movie(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Kino kodini kiriting:")
+    await query.edit_message_text("🔍 Kino kodini kiriting:")
 
 
 async def contact_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -366,7 +428,7 @@ async def contact_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(query.from_user)
     admins = get_admin_ids()
     if not admins:
-        await query.edit_message_text("Adminlar ro'yxati bo'sh.")
+        await query.edit_message_text("⚠️ Adminlar ro'yxati bo'sh.")
         return
 
     user = query.from_user
@@ -375,17 +437,17 @@ async def contact_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 admin_id,
                 (
-                    "Yangi bog'lanish so'rovi\n\n"
-                    f"Foydalanuvchi: {user.first_name}\n"
-                    f"ID: {user.id}\n"
-                    f"Username: @{user.username if user.username else 'mavjud emas'}"
+                    "📞 Yangi bog'lanish so'rovi\n\n"
+                    f"👤 Foydalanuvchi: {user.first_name}\n"
+                    f"🆔 ID: {user.id}\n"
+                    f"📱 Username: @{user.username if user.username else 'mavjud emas'}"
                 ),
             )
         except Exception as exc:
             logger.error("Adminga xabar yuborishda xatolik: %s", exc)
 
     await query.edit_message_text(
-        "So'rovingiz adminlarga yuborildi. Tez orada bog'lanishadi."
+        "✅ So'rovingiz adminlarga yuborildi. Tez orada bog'lanishadi."
     )
 
 
@@ -399,26 +461,46 @@ async def handle_check_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
         code = context.user_data.pop("pending_code", None)
         if code:
             try:
-                await query.edit_message_text("A'zo bo'ldingiz. Kino yuborilmoqda...")
+                await query.edit_message_text("✅ A'zo bo'ldingiz. Kino yuborilmoqda...")
             except Exception:
                 await context.bot.send_message(
-                    user_id, "A'zo bo'ldingiz. Kino yuborilmoqda..."
+                    user_id, "✅ A'zo bo'ldingiz. Kino yuborilmoqda..."
                 )
             await send_movie_by_code(user_id, code, context)
         else:
-            await query.edit_message_text("A'zo bo'ldingiz. Endi kino kodini yuboring.")
+            await query.edit_message_text("✅ A'zo bo'ldingiz. Endi kino kodini yuboring.")
     else:
         try:
             await query.edit_message_text(
-                "Hali kanalga a'zo emassiz. A'zo bo'lib, qayta tekshiring.",
+                "❌ Hali kanalga a'zo emassiz. A'zo bo'lib, qayta tekshiring.",
                 reply_markup=force_sub_keyboard(),
             )
         except Exception:
             await context.bot.send_message(
                 user_id,
-                "Hali kanalga a'zo emassiz. A'zo bo'lib, qayta tekshiring.",
+                "❌ Hali kanalga a'zo emassiz. A'zo bo'lib, qayta tekshiring.",
                 reply_markup=force_sub_keyboard(),
             )
+
+
+async def handle_random_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    rows = get_random_movies(15)
+    if not rows:
+        await query.edit_message_text("⚠️ Hozircha kino yo'q.")
+        return
+
+    text = "🎲 Tasodifiy kinolar:\n\n"
+    for idx, item in enumerate(rows, start=1):
+        text += f"{idx}. {item['desc']} | 👁️ {item['views']} - 🆔 {item['code']}\n"
+        if idx == 9:
+            text += "\n📢 @multverseuz kanaliga obuna bo'ling.\n\n"
+
+    await query.edit_message_text(
+        text, reply_markup=numbered_keyboard(rows)
+    )
 
 
 async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -428,6 +510,20 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
 
+    if data.startswith("pick_"):
+        code = data.replace("pick_", "", 1)
+        if not is_admin(user_id):
+            subscribed = await is_user_subscribed(user_id, context)
+            if not subscribed:
+                context.user_data["pending_code"] = code
+                await query.edit_message_text(
+                    "📢 Kino olishdan oldin kanalga a'zo bo'ling.",
+                    reply_markup=force_sub_keyboard(),
+                )
+                return
+        await send_movie_by_code(user_id, code, context)
+        return
+
     if data == "check_sub":
         return await handle_check_sub(update, context)
     if data == "search_movie":
@@ -436,21 +532,23 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await contact_admin(update, context)
     if data == "main_menu":
         return await main_menu(update, context)
+    if data == "random_movies":
+        return await handle_random_movies(update, context)
 
     if not is_admin(user_id):
-        await query.edit_message_text("Bu bo'lim faqat adminlar uchun.")
+        await query.edit_message_text("⚠️ Bu bo'lim faqat adminlar uchun.")
         return
 
     if data == "add_movie":
         context.user_data["admin_mode"] = "add_code"
-        await query.edit_message_text("Yangi kino kodi (masalan: A123):")
+        await query.edit_message_text("📝 Yangi kino kodi (masalan: A123):")
         return
 
     if data == "delete_movie":
         context.user_data["admin_mode"] = "delete"
         rows = list_movies()
         if not rows:
-            await query.edit_message_text("Hozircha kino yo'q.")
+            await query.edit_message_text("⚠️ Hozircha kino yo'q.")
             return
 
         keyboard = []
@@ -464,10 +562,10 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 row = []
         if row:
             keyboard.append(row)
-        keyboard.append([InlineKeyboardButton("Orqaga", callback_data="back_to_admin")])
+        keyboard.append([InlineKeyboardButton("◀️ Orqaga", callback_data="back_to_admin")])
 
         await query.edit_message_text(
-            "O'chirmoqchi bo'lgan kino kodini tanlang:",
+            "🗑 O'chirmoqchi bo'lgan kino kodini tanlang:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
@@ -476,23 +574,23 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         code = data.replace("delete_", "")
         deleted = delete_movie(code)
         if deleted:
-            await query.edit_message_text(f"Kino o'chirildi: {code}")
+            await query.edit_message_text(f"✅ Kino o'chirildi: {code}")
         else:
-            await query.edit_message_text("Bunday kod topilmadi.")
+            await query.edit_message_text("⚠️ Bunday kod topilmadi.")
         return
 
     if data == "list_movies":
         rows = list_movies()
         if not rows:
-            await query.edit_message_text("Hozircha kino yo'q.")
+            await query.edit_message_text("⚠️ Hozircha kino yo'q.")
             return
-        text = "Kinolar ro'yxati:\n\n"
+        text = "📋 Kinolar ro'yxati:\n\n"
         for item in rows:
             desc = item["desc"]
-            text += f"{item['code']} - {desc[:50]}"
+            text += f"🆔 {item['code']} - {desc[:50]}"
             if len(desc) > 50:
                 text += "..."
-            text += "\n"
+            text += f" | 👁️ {item['views']}\n"
         if len(text) > 4000:
             text = text[:4000] + "\n\n...ro'yxat juda uzun."
         await query.edit_message_text(text)
@@ -501,12 +599,12 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "admin_stats":
         total, counts = movie_stats()
         stats_text = (
-            "Admin statistikasi\n\n"
-            f"Jami kinolar: {total}\n"
-            f"Videolar: {counts.get('video', 0)}\n"
-            f"Rasmlar: {counts.get('photo', 0)}\n"
-            f"Matnlar: {counts.get('text', 0)}\n"
-            f"Hujjatlar: {counts.get('document', 0)}"
+            "📊 Admin statistikasi\n\n"
+            f"📁 Jami kinolar: {total}\n"
+            f"🎥 Videolar: {counts.get('video', 0)}\n"
+            f"🖼 Rasmlar: {counts.get('photo', 0)}\n"
+            f"📝 Matnlar: {counts.get('text', 0)}\n"
+            f"📄 Hujjatlar: {counts.get('document', 0)}"
         )
         await query.edit_message_text(stats_text)
         return
@@ -514,13 +612,13 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "broadcast":
         context.user_data["admin_mode"] = "broadcast"
         await query.edit_message_text(
-            "Broadcast uchun xabar yuboring (matn yoki media)."
+            "📢 Broadcast uchun xabar yuboring (matn yoki media)."
         )
         return
 
     if data == "back_to_admin":
         await query.edit_message_text(
-            "Admin paneli:", reply_markup=admin_panel_keyboard()
+            "⚙️ Admin paneli:", reply_markup=admin_panel_keyboard()
         )
 
 
@@ -534,52 +632,78 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if mode == "add_code":
         code = update.message.text.strip().upper()
         if not code:
-            return await update.message.reply_text("Kod bo'sh bo'lmasligi kerak.")
+            return await update.message.reply_text("⚠️ Kod bo'sh bo'lmasligi kerak.")
         if get_movie(code):
             return await update.message.reply_text(
-                "Bu kod allaqachon mavjud. Boshqa kod kiriting."
+                "⚠️ Bu kod allaqachon mavjud. Boshqa kod kiriting."
             )
         context.user_data["new_code"] = code
         context.user_data["admin_mode"] = "add_desc"
-        return await update.message.reply_text("Kino tavsifini yozing:")
+        return await update.message.reply_text("📝 Kino tavsifini yozing:")
 
     if mode == "add_desc":
         desc = update.message.text.strip()
         if not desc:
-            return await update.message.reply_text("Tavsif bo'sh bo'lmasligi kerak.")
+            return await update.message.reply_text("⚠️ Tavsif bo'sh bo'lmasligi kerak.")
         context.user_data["new_desc"] = desc
+        context.user_data["admin_mode"] = "add_parent"
+        return await update.message.reply_text(
+            "🎬 Agar serial bo'lsa, asosiy kodini yuboring. Aks holda '-' yuboring:"
+        )
+
+    if mode == "add_parent":
+        parent_code = update.message.text.strip().upper()
+        if parent_code == "-":
+            parent_code = None
+        if parent_code and not parent_code.strip():
+            parent_code = None
+        context.user_data["new_parent"] = parent_code
         context.user_data["admin_mode"] = "add_file"
         return await update.message.reply_text(
-            "Endi video, rasm, hujjat yoki matn yuboring:"
+            "📤 Endi:\n"
+            "1️⃣ Video/rasm faylni yuboring, yoki\n"
+            "2️⃣ File_ID matn sifatida kiriting"
         )
 
     if mode == "add_file":
+        # Admin file_id matn sifatida yuborsa
+        file_id_text = update.message.text.strip()
+        if not file_id_text:
+            return await update.message.reply_text("⚠️ File_id bo'sh bo'lmasligi kerak.")
+        
         code = context.user_data.get("new_code")
         desc = context.user_data.get("new_desc")
+        parent_code = context.user_data.get("new_parent")
+        
         if not code or not desc:
             context.user_data["admin_mode"] = None
-            return await update.message.reply_text(
-                "Xatolik yuz berdi. Qaytadan boshlang."
-            )
+            return await update.message.reply_text("⚠️ Xatolik yuz berdi. Qaytadan boshlang.")
+        
         try:
-            add_movie(code, "text", update.message.text, desc)
+            # Default turi video (file_id kiritilganda)
+            add_movie(code, "video", file_id_text, desc, parent_code)
             context.user_data["admin_mode"] = None
             await update.message.reply_text(
-                f"Kino qo'shildi.\nKod: {code}\nTavsif: {desc}",
+                f"✅ Kino qo'shildi!\n\n"
+                f"🆔 Kod: {code}\n"
+                f"📝 Tavsif: {desc}\n"
+                f"📁 Turi: video\n"
+                f"🔗 File_ID: {file_id_text[:30]}...",
                 reply_markup=admin_panel_keyboard(),
             )
         except Exception as exc:
             logger.error("Kino qo'shishda xatolik: %s", exc)
-            await update.message.reply_text("Kino qo'shishda xatolik yuz berdi.")
+            await update.message.reply_text("❌ Kino qo'shishda xatolik yuz berdi.")
         return
+
 
     if mode == "delete":
         code = update.message.text.strip().upper()
         deleted = delete_movie(code)
         context.user_data["admin_mode"] = None
         if deleted:
-            return await update.message.reply_text(f"Kino o'chirildi: {code}")
-        return await update.message.reply_text("Bunday kod topilmadi.")
+            return await update.message.reply_text(f"✅ Kino o'chirildi: {code}")
+        return await update.message.reply_text("⚠️ Bunday kod topilmadi.")
 
     if mode == "broadcast":
         return await broadcast_message(update, context)
@@ -602,26 +726,30 @@ async def handle_admin_media(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     code = context.user_data.get("new_code")
     desc = context.user_data.get("new_desc")
+    parent_code = context.user_data.get("new_parent")
     if not code or not desc:
         context.user_data["admin_mode"] = None
-        return await update.message.reply_text("Xatolik yuz berdi. Qaytadan boshlang.")
+        return await update.message.reply_text("⚠️ Xatolik yuz berdi. Qaytadan boshlang.")
 
     content_type, file_id = extract_media(update)
     if not content_type:
         return await update.message.reply_text(
-            "Faqat video, rasm yoki hujjat yuboring."
+            "⚠️ Faqat video, rasm yoki hujjat yuboring."
         )
 
     try:
-        add_movie(code, content_type, file_id, desc)
+        add_movie(code, content_type, file_id, desc, parent_code)
         context.user_data["admin_mode"] = None
         await update.message.reply_text(
-            f"Kino qo'shildi.\nKod: {code}\nTavsif: {desc}",
+            f"✅ Kino qo'shildi!\n\n"
+            f"🆔 Kod: {code}\n"
+            f"📝 Tavsif: {desc}\n"
+            f"📁 Turi: {content_type}",
             reply_markup=admin_panel_keyboard(),
         )
     except Exception as exc:
         logger.error("Kino qo'shishda xatolik: %s", exc)
-        await update.message.reply_text("Kino qo'shishda xatolik yuz berdi.")
+        await update.message.reply_text("❌ Kino qo'shishda xatolik yuz berdi.")
 
 
 def extract_media(update: Update):
@@ -640,7 +768,7 @@ async def send_movie_by_code(chat_id, code, context: ContextTypes.DEFAULT_TYPE):
     if not movie:
         await context.bot.send_message(
             chat_id,
-            f"Bunday koddagi kino topilmadi.\nKod: {code}",
+            f"⚠️ Bunday koddagi kino topilmadi.\n🆔 Kod: {code}",
             reply_markup=not_found_keyboard(),
         )
         return
@@ -648,7 +776,7 @@ async def send_movie_by_code(chat_id, code, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_movie_to_chat(chat_id, movie, code, context: ContextTypes.DEFAULT_TYPE):
-    caption = f"Kod: {code}\n{movie['desc']}\n"
+    caption = f"🆔 Kod: {code}\n📝 {movie['desc']}\n👁️ Ko'rishlar: {movie.get('views', 0) + 1}"
     send_map = {
         "video": context.bot.send_video,
         "photo": context.bot.send_photo,
@@ -656,18 +784,20 @@ async def send_movie_to_chat(chat_id, movie, code, context: ContextTypes.DEFAULT
     }
     try:
         if movie["type"] == "text":
-            text = f"{caption}\n{movie['file_id']}"
+            text = f"{caption}\n\n{movie['file_id']}"
             await context.bot.send_message(chat_id, text)
+            increment_views(code)
             return
         sender = send_map.get(movie["type"])
         if not sender:
             raise ValueError(f"Noma'lum kontent turi: {movie['type']}")
         await sender(chat_id, movie["file_id"], caption=caption)
+        increment_views(code)
     except Exception as exc:
         logger.error("Kontentni yuborishda xatolik: %s", exc)
         await context.bot.send_message(
             chat_id,
-            "Kontentni yuborishda xatolik yuz berdi. Iltimos, keyinroq urinib ko'ring.",
+            "❌ Kontentni yuborishda xatolik yuz berdi. Iltimos, keyinroq urinib ko'ring.",
         )
 
 
@@ -675,19 +805,51 @@ async def handle_user_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
     code = update.message.text.strip().upper()
     if not code:
-        return await update.message.reply_text("Kod bo'sh bo'lmasligi kerak.")
+        return await update.message.reply_text("⚠️ Kod bo'sh bo'lmasligi kerak.")
 
     if not is_admin(update.effective_user.id):
         subscribed = await is_user_subscribed(update.effective_user.id, context)
         if not subscribed:
             context.user_data["pending_code"] = code
             await update.message.reply_text(
-                "Kino olishdan oldin kanalga a'zo bo'ling.",
+                "📢 Kino olishdan oldin kanalga a'zo bo'ling.",
                 reply_markup=force_sub_keyboard(),
             )
             return
 
+    movie = get_movie(code)
+    if movie:
+        return await send_movie_to_chat(update.effective_chat.id, movie, code, context)
+
+    children = get_children(code)
+    if children:
+        text = "📺 Qismlar ro'yxati:\n\n"
+        for idx, item in enumerate(children, start=1):
+            text += f"{idx}. {item['desc']} | 👁️ {item['views']} - 🆔 {item['code']}\n"
+            if idx == 9:
+                text += "\n📢 @multverseuz kanaliga obuna bo'ling.\n\n"
+        await update.message.reply_text(
+            text, reply_markup=numbered_keyboard(children)
+        )
+        return
+
     await send_movie_by_code(update.effective_chat.id, code, context)
+
+
+async def random_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = get_random_movies(15)
+    if not rows:
+        return await update.message.reply_text("⚠️ Hozircha kino yo'q.")
+
+    text = "🎲 Tasodifiy kinolar:\n\n"
+    for idx, item in enumerate(rows, start=1):
+        text += f"{idx}. {item['desc']} | 👁️ {item['views']} - 🆔 {item['code']}\n"
+        if idx == 9:
+            text += "\n📢 @multverseuz kanaliga obuna bo'ling.\n\n"
+
+    await update.message.reply_text(
+        text, reply_markup=numbered_keyboard(rows)
+    )
 
 
 async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -697,7 +859,7 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_ids = get_all_user_ids()
     if not user_ids:
         context.user_data["admin_mode"] = None
-        return await update.message.reply_text("Foydalanuvchilar topilmadi.")
+        return await update.message.reply_text("⚠️ Foydalanuvchilar topilmadi.")
 
     context.user_data["admin_mode"] = None
     source_chat_id = update.effective_chat.id
@@ -728,14 +890,14 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         failed += sum(1 for r in results if not r)
 
     await update.message.reply_text(
-        f"Broadcast yakunlandi.\nYuborildi: {sent}\nXatolik: {failed}"
+        f"✅ Broadcast yakunlandi.\n📤 Yuborildi: {sent}\n❌ Xatolik: {failed}"
     )
 
 
 async def handle_other_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
     await update.message.reply_text(
-        "Kino topish uchun kod yuboring yoki menyudan foydalaning.",
+        "🔍 Kino topish uchun kod yuboring yoki menyudan foydalaning.",
         reply_markup=main_menu_keyboard(),
     )
 
@@ -749,9 +911,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN .env faylida yo'q.")
+        raise RuntimeError("❌ BOT_TOKEN .env faylida yo'q.")
     if not ADMIN_CODE:
-        raise RuntimeError("ADMIN_CODE .env faylida yo'q.")
+        raise RuntimeError("❌ ADMIN_CODE .env faylida yo'q.")
 
     init_db()
 
@@ -759,6 +921,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("rand", random_movies))
     app.add_handler(CallbackQueryHandler(admin_callbacks))
     app.add_handler(
         MessageHandler(
@@ -772,7 +935,7 @@ def main():
     )
     app.add_handler(MessageHandler(filters.ALL, handle_other_messages))
 
-    logger.info("Bot ishga tushdi...")
+    logger.info("🚀 Bot ishga tushdi...")
     app.run_polling()
 
 

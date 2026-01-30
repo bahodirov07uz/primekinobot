@@ -2,3 +2,4 @@ admins.json
 movies.json
 env
 .env
+bot.db
