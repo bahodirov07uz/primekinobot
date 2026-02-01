@@ -18,10 +18,11 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_CODE = os.getenv("ADMIN_CODE")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
-FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "")
 FORCE_SUB_LINK = os.getenv("FORCE_SUB_LINK", "")
+
+# Admin ID'lar - vergul bilan ajratilgan
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -38,10 +39,12 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
+        # Movies table with 'name' column
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS movies (
                 code TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
                 type TEXT NOT NULL,
                 file_id TEXT NOT NULL,
                 desc TEXT NOT NULL,
@@ -51,29 +54,55 @@ def init_db():
             )
             """
         )
+        # Users table - tracks all users with premium status
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
-                is_admin INTEGER DEFAULT 0,
+                is_premium INTEGER DEFAULT 0,
+                premium_until TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
-    ensure_movie_columns()
+        # Force subscribe channels table
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS force_channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL UNIQUE,
+                channel_link TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    ensure_columns()
     migrate_legacy_json()
 
 
-def ensure_movie_columns():
+def ensure_columns():
     with get_db() as conn:
+        # Check movies table
         rows = conn.execute("PRAGMA table_info(movies)").fetchall()
         columns = {row["name"] for row in rows}
+        
+        if "name" not in columns:
+            conn.execute("ALTER TABLE movies ADD COLUMN name TEXT DEFAULT ''")
         if "parent_code" not in columns:
             conn.execute("ALTER TABLE movies ADD COLUMN parent_code TEXT")
         if "views" not in columns:
             conn.execute("ALTER TABLE movies ADD COLUMN views INTEGER DEFAULT 0")
+        
+        # Check users table for premium columns
+        user_rows = conn.execute("PRAGMA table_info(users)").fetchall()
+        user_columns = {row["name"] for row in user_rows}
+        
+        if "is_premium" not in user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN is_premium INTEGER DEFAULT 0")
+        if "premium_until" not in user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN premium_until TEXT")
 
 
 def migrate_legacy_json():
@@ -85,12 +114,13 @@ def migrate_legacy_json():
                 for code, movie in data.items():
                     conn.execute(
                         """
-                        INSERT OR IGNORE INTO movies (code, type, file_id, desc, parent_code, views)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        INSERT OR IGNORE INTO movies (code, name, type, file_id, desc, parent_code, views)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             str(code).upper(),
-                            movie.get("type", "text"),
+                            movie.get("name", ""),
+                            movie.get("type", "video"),  # Default to video
                             movie.get("file_id", ""),
                             movie.get("desc", ""),
                             movie.get("parent_code"),
@@ -101,30 +131,9 @@ def migrate_legacy_json():
         except Exception as exc:
             logger.error("movies.json migratsiyasida xatolik: %s", exc)
 
-    if os.path.exists("admins.json"):
-        try:
-            with open("admins.json", "r", encoding="utf-8") as f:
-                admins = json.load(f)
-            with get_db() as conn:
-                for admin_id in admins:
-                    try:
-                        admin_id = int(admin_id)
-                    except (TypeError, ValueError):
-                        continue
-                    conn.execute(
-                        """
-                        INSERT INTO users (user_id, is_admin)
-                        VALUES (?, 1)
-                        ON CONFLICT(user_id) DO UPDATE SET is_admin = 1
-                        """,
-                        (admin_id,),
-                    )
-            logger.info("admins.json dan adminlar ko'chirildi.")
-        except Exception as exc:
-            logger.error("admins.json migratsiyasida xatolik: %s", exc)
-
 
 def upsert_user(user):
+    """Track all users who interact with bot"""
     if not user:
         return
     with get_db() as conn:
@@ -141,32 +150,8 @@ def upsert_user(user):
 
 
 def is_admin(user_id):
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM users WHERE user_id = ? AND is_admin = 1",
-            (user_id,),
-        ).fetchone()
-    return bool(row)
-
-
-def set_admin(user_id):
-    with get_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO users (user_id, is_admin)
-            VALUES (?, 1)
-            ON CONFLICT(user_id) DO UPDATE SET is_admin = 1
-            """,
-            (user_id,),
-        )
-
-
-def get_admin_ids():
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT user_id FROM users WHERE is_admin = 1"
-        ).fetchall()
-    return [row["user_id"] for row in rows]
+    """Check if user is admin based on ADMIN_IDS from .env"""
+    return user_id in ADMIN_IDS
 
 
 def get_all_user_ids():
@@ -175,23 +160,96 @@ def get_all_user_ids():
     return [row["user_id"] for row in rows]
 
 
+def get_user_count():
+    """Get total number of users"""
+    with get_db() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    return count
+
+
+def is_user_premium(user_id):
+    """Check if user has active premium"""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT is_premium, premium_until FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    
+    if not row:
+        return False
+    
+    if not row["is_premium"]:
+        return False
+    
+    # Check expiration
+    if row["premium_until"]:
+        from datetime import datetime
+        try:
+            expiry = datetime.fromisoformat(row["premium_until"])
+            if datetime.now() > expiry:
+                # Premium expired
+                return False
+        except:
+            pass
+    
+    return True
+
+
+def set_user_premium(user_id, months=1):
+    """Set user as premium for given months"""
+    from datetime import datetime, timedelta
+    
+    expiry_date = datetime.now() + timedelta(days=30 * months)
+    
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (user_id, is_premium, premium_until)
+            VALUES (?, 1, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                is_premium = 1,
+                premium_until = excluded.premium_until
+            """,
+            (user_id, expiry_date.isoformat()),
+        )
+
+
+def remove_user_premium(user_id):
+    """Remove premium from user"""
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE users SET is_premium = 0, premium_until = NULL WHERE user_id = ?",
+            (user_id,),
+        )
+
+
+def get_premium_stats():
+    """Get premium statistics"""
+    with get_db() as conn:
+        premium_count = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE is_premium = 1"
+        ).fetchone()[0]
+        total_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    return premium_count, total_count
+
+
 def get_movie(code):
     with get_db() as conn:
         row = conn.execute(
-            "SELECT code, type, file_id, desc, parent_code, views FROM movies WHERE code = ?",
+            "SELECT code, name, type, file_id, desc, parent_code, views FROM movies WHERE code = ?",
             (code,),
         ).fetchone()
     return dict(row) if row else None
 
 
-def add_movie(code, content_type, file_id, desc, parent_code=None):
+def add_movie(code, name, content_type, file_id, desc, parent_code=None):
     with get_db() as conn:
         conn.execute(
             """
-            INSERT INTO movies (code, type, file_id, desc, parent_code)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO movies (code, name, type, file_id, desc, parent_code)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (code, content_type, file_id, desc, parent_code),
+            (code, name, content_type, file_id, desc, parent_code),
         )
 
 
@@ -204,7 +262,7 @@ def delete_movie(code):
 def list_movies():
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT code, desc, type, views, parent_code FROM movies ORDER BY code"
+            "SELECT code, name, desc, type, views, parent_code FROM movies ORDER BY created_at DESC"
         ).fetchall()
     return rows
 
@@ -222,19 +280,20 @@ def movie_stats():
 def get_random_movies(limit=15):
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT code, desc, views FROM movies ORDER BY RANDOM() LIMIT ?",
+            "SELECT code, name, desc, views FROM movies ORDER BY RANDOM() LIMIT ?",
             (limit,),
         ).fetchall()
     return rows
 
 
 def get_children(parent_code):
+    """Get series episodes - OLDEST FIRST (created_at ASC)"""
     with get_db() as conn:
         rows = conn.execute(
             """
-            SELECT code, desc, views FROM movies
+            SELECT code, name, desc, views FROM movies
             WHERE parent_code = ?
-            ORDER BY code
+            ORDER BY created_at ASC
             """,
             (parent_code,),
         ).fetchall()
@@ -249,12 +308,33 @@ def increment_views(code):
         )
 
 
+# Force subscribe channels management
+def add_force_channel(channel_id, channel_link):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO force_channels (channel_id, channel_link) VALUES (?, ?)",
+            (channel_id, channel_link),
+        )
+
+
+def remove_force_channel(channel_id):
+    with get_db() as conn:
+        cur = conn.execute("DELETE FROM force_channels WHERE channel_id = ?", (channel_id,))
+        conn.commit()
+    return cur.rowcount
+
+
+def get_force_channels():
+    with get_db() as conn:
+        rows = conn.execute("SELECT channel_id, channel_link FROM force_channels").fetchall()
+    return [(row["channel_id"], row["channel_link"]) for row in rows]
+
+
 def main_menu_keyboard():
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton("🔍 Kino qidirish", callback_data="search_movie"),
-                InlineKeyboardButton("📞 Admin", callback_data="contact_admin"),
             ],
             [
                 InlineKeyboardButton("🎲 Tasodifiy kinolar", callback_data="random_movies"),
@@ -274,7 +354,18 @@ def admin_panel_keyboard():
                 InlineKeyboardButton("📋 Kinolar ro'yxati", callback_data="list_movies"),
                 InlineKeyboardButton("📊 Statistika", callback_data="admin_stats"),
             ],
-            [InlineKeyboardButton("📢 Xabar yuborish", callback_data="broadcast")],
+            [
+                InlineKeyboardButton("➕ Kanal qo'shish", callback_data="add_channel"),
+                InlineKeyboardButton("🗑 Kanal o'chirish", callback_data="delete_channel"),
+            ],
+            [
+                InlineKeyboardButton("💎 Premium berish", callback_data="give_premium"),
+                InlineKeyboardButton("🚫 Premium olish", callback_data="remove_premium"),
+            ],
+            [
+                InlineKeyboardButton("📢 Xabar yuborish", callback_data="broadcast"),
+                InlineKeyboardButton("👥 Foydalanuvchilar", callback_data="user_stats"),
+            ],
             [InlineKeyboardButton("🏠 Bosh menyu", callback_data="main_menu")],
         ]
     )
@@ -307,40 +398,66 @@ def numbered_keyboard(items, prefix="pick"):
 
 
 def force_sub_keyboard():
+    """Force subscribe keyboard with premium option at the bottom"""
     buttons = []
-    link = get_channel_link()
-    if link:
-        buttons.append([InlineKeyboardButton("📢 Kanalga a'zo bo'lish", url=link)])
+    channels = get_force_channels()
+    
+    for channel_id, channel_link in channels:
+        buttons.append([InlineKeyboardButton(f"📢 {channel_id} ga qo'shilish", url=channel_link)])
+    
     buttons.append([InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub")])
-    buttons.append([InlineKeyboardButton("🏠 Bosh menyu", callback_data="main_menu")])
+    
+    # Premium purchase options at the bottom
+    buttons.append([InlineKeyboardButton("💎 Premium sotib olish", callback_data="buy_premium")])
+    
     return InlineKeyboardMarkup(buttons)
 
 
-def get_channel_link():
-    if FORCE_SUB_LINK:
-        return FORCE_SUB_LINK
-    if FORCE_SUB_CHANNEL:
-        if FORCE_SUB_CHANNEL.startswith("@"):
-            return f"https://t.me/{FORCE_SUB_CHANNEL[1:]}"
-        return f"https://t.me/{FORCE_SUB_CHANNEL}"
-    return ""
+def premium_prices_keyboard():
+    """Premium purchase options with prices"""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💎 1 oy - 5,000 so'm", callback_data="premium_price_1")],
+        [InlineKeyboardButton("💎 3 oy - 14,000 so'm", callback_data="premium_price_3")],
+        [InlineKeyboardButton("💎 6 oy - 27,000 so'm", callback_data="premium_price_6")],
+        [InlineKeyboardButton("💎 12 oy - 50,000 so'm", callback_data="premium_price_12")],
+        [InlineKeyboardButton("◀️ Orqaga", callback_data="main_menu")],
+    ])
 
 
 async def is_user_subscribed(user_id, context: ContextTypes.DEFAULT_TYPE):
-    if not FORCE_SUB_CHANNEL:
+    """Check if user is subscribed to all force channels OR has premium"""
+    
+    # Premium users skip force subscribe
+    if is_user_premium(user_id):
         return True
-    try:
-        member = await context.bot.get_chat_member(FORCE_SUB_CHANNEL, user_id)
-        return member.status in ("member", "administrator", "creator")
-    except Exception as exc:
-        logger.error("Force subscribe tekshiruvida xatolik: %s", exc)
-        return False
+    
+    channels = get_force_channels()
+    
+    if not channels:
+        return True
+    
+    for channel_id, _ in channels:
+        try:
+            member = await context.bot.get_chat_member(channel_id, user_id)
+            if member.status not in ("member", "administrator", "creator"):
+                return False
+        except Exception as exc:
+            logger.error(f"Force subscribe tekshiruvida xatolik ({channel_id}): %s", exc)
+            return False
+    
+    return True
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
+    
+    # Show premium status if user has it
+    premium_text = ""
+    if is_user_premium(update.effective_user.id):
+        premium_text = "\n\n💎 Siz Premium foydalanuvchisiz!"
+    
     text = (
-        "🎬 Salom! Kino botiga xush kelibsiz.\n\n"
+        f"🎬 Salom! Kino botiga xush kelibsiz.{premium_text}\n\n"
         "📝 Kino kodini yuboring yoki quyidagi menyudan foydalaning."
     )
     await update.message.reply_text(
@@ -349,62 +466,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin panel - only for ADMIN_IDS from .env"""
     upsert_user(update.effective_user)
-    if not ADMIN_CODE:
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
         await update.message.reply_text(
-            "⚠️ ADMIN_CODE sozlanmagan. .env faylini tekshiring."
+            "❌ Sizda admin huquqi yo'q.\n\n"
+            "Agar admin bo'lmoqchi bo'lsangiz, bot egasi bilan bog'laning."
         )
         return
-
-    if len(context.args) == 0:
-        context.user_data["awaiting_admin_code"] = True
-        await update.message.reply_text("🔐 Admin kodini kiriting:")
-        return
-
-    code = context.args[0]
-    if code == ADMIN_CODE:
-        set_admin(update.effective_user.id)
-        await update.message.reply_text(
-            "✅ Admin paneli:", reply_markup=admin_panel_keyboard()
-        )
-    else:
-        await notify_admin_attempt(update, context, code)
-        await update.message.reply_text("❌ Noto'g'ri admin kodi!")
-
-
-async def notify_admin_attempt(update: Update, context: ContextTypes.DEFAULT_TYPE, code):
-    admins = get_admin_ids()
-    if not admins:
-        return
-    user = update.effective_user
-    for admin_id in admins:
-        try:
-            await context.bot.send_message(
-                admin_id,
-                (
-                    "⚠️ Ogohlantirish!\n\n"
-                    "❌ Foydalanuvchi admin paneliga kirishga urindi:\n"
-                    f"👤 Ism: {user.first_name}\n"
-                    f"🆔 ID: {user.id}\n"
-                    f"📱 Username: @{user.username if user.username else 'mavjud emas'}\n"
-                    f"🔑 Kiritilgan kod: {code}"
-                ),
-            )
-        except Exception as exc:
-            logger.error("Admin ogohlantirishida xatolik: %s", exc)
-
-
-async def handle_admin_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    code = update.message.text.strip()
-    if code == ADMIN_CODE:
-        set_admin(update.effective_user.id)
-        context.user_data["awaiting_admin_code"] = False
-        await update.message.reply_text(
-            "✅ Admin paneli:", reply_markup=admin_panel_keyboard()
-        )
-    else:
-        await notify_admin_attempt(update, context, code)
-        await update.message.reply_text("❌ Noto'g'ri admin kodi!")
+    
+    await update.message.reply_text(
+        "✅ Admin paneli:", reply_markup=admin_panel_keyboard()
+    )
 
 
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -426,13 +501,13 @@ async def contact_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     upsert_user(query.from_user)
-    admins = get_admin_ids()
-    if not admins:
+    
+    if not ADMIN_IDS:
         await query.edit_message_text("⚠️ Adminlar ro'yxati bo'sh.")
         return
 
     user = query.from_user
-    for admin_id in admins:
+    for admin_id in ADMIN_IDS:
         try:
             await context.bot.send_message(
                 admin_id,
@@ -494,9 +569,10 @@ async def handle_random_movies(update: Update, context: ContextTypes.DEFAULT_TYP
 
     text = "🎲 Tasodifiy kinolar:\n\n"
     for idx, item in enumerate(rows, start=1):
-        text += f"{idx}. {item['desc']} | 👁️ {item['views']} - 🆔 {item['code']}\n"
+        name = item['name'] or item['desc']
+        text += f"{idx}. {name} | 👁️ {item['views']} - 🆔 {item['code']}\n"
         if idx == 9:
-            text += "\n📢 @multverseuz kanaliga obuna bo'ling.\n\n"
+            text += "\n📢 @primekin0 kanaliga obuna bo'ling.\n\n"
 
     await query.edit_message_text(
         text, reply_markup=numbered_keyboard(rows)
@@ -535,6 +611,38 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "random_movies":
         return await handle_random_movies(update, context)
 
+    # Premium purchase for regular users
+    if data == "buy_premium":
+        await query.edit_message_text(
+            "💎 Premium obuna\n\n"
+            "Premium foydalanuvchilar uchun imtiyozlar:\n"
+            "✅ Majburiy kanallarga obuna bo'lmasdan kinolar\n"
+            "✅ Reklama yo'q\n"
+            "✅ Yangi kinolar birinchi bo'lib\n\n"
+            "Narxlarni tanlang:",
+            reply_markup=premium_prices_keyboard()
+        )
+        return
+
+    if data.startswith("premium_price_"):
+        months = int(data.split("_")[2])
+        prices = {1: 5000, 3: 14000, 6: 27000, 12: 50000}
+        price = prices.get(months, 5000)
+        
+        await query.edit_message_text(
+            f"💎 Premium obuna - {months} oy\n\n"
+            f"💰 Narx: {price:,} so'm\n\n"
+            f"To'lov uchun admin bilan bog'laning:\n"
+            f"🆔 Sizning ID: {user_id}\n\n"
+            "To'lov qilgandan keyin adminlarga xabar bering.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📞 Admin", callback_data="contact_admin")],
+                [InlineKeyboardButton("◀️ Orqaga", callback_data="buy_premium")]
+            ])
+        )
+        return
+
+    # Admin-only callbacks below
     if not is_admin(user_id):
         await query.edit_message_text("⚠️ Bu bo'lim faqat adminlar uchun.")
         return
@@ -584,29 +692,111 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await query.edit_message_text("⚠️ Hozircha kino yo'q.")
             return
-        text = "📋 Kinolar ro'yxati:\n\n"
-        for item in rows:
-            desc = item["desc"]
-            text += f"🆔 {item['code']} - {desc[:50]}"
-            if len(desc) > 50:
-                text += "..."
-            text += f" | 👁️ {item['views']}\n"
-        if len(text) > 4000:
-            text = text[:4000] + "\n\n...ro'yxat juda uzun."
+        text = "📋 Kinolar ro'yxati (yangi → eski):\n\n"
+        for item in rows[:50]:  # First 50
+            name = item["name"] or item["desc"][:30]
+            text += f"🆔 {item['code']} - {name} | 👁️ {item['views']}\n"
+        if len(rows) > 50:
+            text += f"\n...va yana {len(rows) - 50} ta kino"
         await query.edit_message_text(text)
         return
 
     if data == "admin_stats":
         total, counts = movie_stats()
+        user_count = get_user_count()
+        premium_count, _ = get_premium_stats()
         stats_text = (
             "📊 Admin statistikasi\n\n"
+            f"👥 Foydalanuvchilar: {user_count}\n"
+            f"💎 Premium: {premium_count}\n"
             f"📁 Jami kinolar: {total}\n"
             f"🎥 Videolar: {counts.get('video', 0)}\n"
+            f"📄 Hujjatlar: {counts.get('document', 0)}\n"
             f"🖼 Rasmlar: {counts.get('photo', 0)}\n"
-            f"📝 Matnlar: {counts.get('text', 0)}\n"
-            f"📄 Hujjatlar: {counts.get('document', 0)}"
+            f"📝 Matnlar: {counts.get('text', 0)}"
         )
         await query.edit_message_text(stats_text)
+        return
+
+    if data == "user_stats":
+        user_count = get_user_count()
+        premium_count, total = get_premium_stats()
+        await query.edit_message_text(
+            f"👥 Foydalanuvchilar statistikasi\n\n"
+            f"Jami foydalanuvchilar: {total}\n"
+            f"💎 Premium foydalanuvchilar: {premium_count}\n"
+            f"👤 Oddiy foydalanuvchilar: {total - premium_count}"
+        )
+        return
+
+    if data == "give_premium":
+        context.user_data["admin_mode"] = "give_premium_id"
+        await query.edit_message_text(
+            "💎 Premium berish\n\n"
+            "Foydalanuvchi ID yoki username kiriting:\n"
+            "Masalan: 123456789 yoki @username"
+        )
+        return
+
+    if data == "remove_premium":
+        context.user_data["admin_mode"] = "remove_premium_id"
+        await query.edit_message_text(
+            "🚫 Premium olish\n\n"
+            "Foydalanuvchi ID kiriting:\n"
+            "Masalan: 123456789"
+        )
+        return
+
+    if data == "add_channel":
+        context.user_data["admin_mode"] = "add_channel_id"
+        await query.edit_message_text(
+            "📢 Majburiy kanal ID'sini kiriting:\n\n"
+            "Masalan: @primekin0 yoki -1001234567890"
+        )
+        return
+
+    if data == "delete_channel":
+        channels = get_force_channels()
+        if not channels:
+            await query.edit_message_text("⚠️ Majburiy kanallar yo'q.")
+            return
+        
+        keyboard = []
+        for channel_id, _ in channels:
+            # URL encode the channel_id to handle special characters
+            import urllib.parse
+            encoded_id = urllib.parse.quote(channel_id, safe='')
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"🗑 {channel_id}", 
+                    callback_data=f"delchan_{encoded_id}"
+                )
+            ])
+        keyboard.append([InlineKeyboardButton("◀️ Orqaga", callback_data="back_to_admin")])
+        
+        await query.edit_message_text(
+            "🗑 O'chirmoqchi bo'lgan kanalni tanlang:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    if data.startswith("delchan_"):
+        # Decode the channel_id
+        import urllib.parse
+        encoded_id = data[8:]  # Remove "delchan_" prefix
+        channel_id = urllib.parse.unquote(encoded_id)
+        
+        removed = remove_force_channel(channel_id)
+        if removed:
+            await query.edit_message_text(
+                f"✅ Kanal o'chirildi: {channel_id}",
+                reply_markup=admin_panel_keyboard()
+            )
+        else:
+            await query.edit_message_text(
+                "⚠️ Kanal topilmadi.",
+                reply_markup=admin_panel_keyboard()
+            )
         return
 
     if data == "broadcast":
@@ -638,6 +828,14 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⚠️ Bu kod allaqachon mavjud. Boshqa kod kiriting."
             )
         context.user_data["new_code"] = code
+        context.user_data["admin_mode"] = "add_name"
+        return await update.message.reply_text("📝 Kino nomini yozing:")
+
+    if mode == "add_name":
+        name = update.message.text.strip()
+        if not name:
+            return await update.message.reply_text("⚠️ Nom bo'sh bo'lmasligi kerak.")
+        context.user_data["new_name"] = name
         context.user_data["admin_mode"] = "add_desc"
         return await update.message.reply_text("📝 Kino tavsifini yozing:")
 
@@ -660,9 +858,8 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["new_parent"] = parent_code
         context.user_data["admin_mode"] = "add_file"
         return await update.message.reply_text(
-            "📤 Endi:\n"
-            "1️⃣ Video/rasm faylni yuboring, yoki\n"
-            "2️⃣ File_ID matn sifatida kiriting"
+            "📤 Endi video FILE_ID ni matn sifatida yuboring:\n\n"
+            "Masalan: BAACAgIAAxkBAAFBjGdpfaHOG3hd3yWFIPZ3-nhmkhZEHQAC2pkAArZd6EtLDMX_kNng_DgE"
         )
 
     if mode == "add_file":
@@ -670,32 +867,32 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id_text = update.message.text.strip()
         if not file_id_text:
             return await update.message.reply_text("⚠️ File_id bo'sh bo'lmasligi kerak.")
-        
+
         code = context.user_data.get("new_code")
+        name = context.user_data.get("new_name")
         desc = context.user_data.get("new_desc")
         parent_code = context.user_data.get("new_parent")
-        
-        if not code or not desc:
+
+        if not code or not name or not desc:
             context.user_data["admin_mode"] = None
             return await update.message.reply_text("⚠️ Xatolik yuz berdi. Qaytadan boshlang.")
-        
+
         try:
-            # Default turi video (file_id kiritilganda)
-            add_movie(code, "video", file_id_text, desc, parent_code)
+            # Default: video (faqat video type ishlatamiz!)
+            add_movie(code, name, "video", file_id_text, desc, parent_code)
             context.user_data["admin_mode"] = None
             await update.message.reply_text(
                 f"✅ Kino qo'shildi!\n\n"
                 f"🆔 Kod: {code}\n"
-                f"📝 Tavsif: {desc}\n"
-                f"📁 Turi: video\n"
-                f"🔗 File_ID: {file_id_text[:30]}...",
+                f"📝 Nom: {name}\n"
+                f"📄 Tavsif: {desc}\n"
+                f"📁 Turi: video",
                 reply_markup=admin_panel_keyboard(),
             )
         except Exception as exc:
             logger.error("Kino qo'shishda xatolik: %s", exc)
             await update.message.reply_text("❌ Kino qo'shishda xatolik yuz berdi.")
         return
-
 
     if mode == "delete":
         code = update.message.text.strip().upper()
@@ -705,6 +902,135 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text(f"✅ Kino o'chirildi: {code}")
         return await update.message.reply_text("⚠️ Bunday kod topilmadi.")
 
+    if mode == "add_channel_id":
+        channel_id = update.message.text.strip()
+        if not channel_id:
+            return await update.message.reply_text("⚠️ Kanal ID bo'sh bo'lmasligi kerak.")
+        context.user_data["new_channel_id"] = channel_id
+        context.user_data["admin_mode"] = "add_channel_link"
+        return await update.message.reply_text(
+            "🔗 Kanal linkini kiriting:\n\n"
+            "Masalan: https://t.me/primekin0"
+        )
+
+    if mode == "add_channel_link":
+        channel_link = update.message.text.strip()
+        if not channel_link:
+            return await update.message.reply_text("⚠️ Link bo'sh bo'lmasligi kerak.")
+
+        channel_id = context.user_data.get("new_channel_id")
+        if not channel_id:
+            context.user_data["admin_mode"] = None
+            return await update.message.reply_text("⚠️ Xatolik yuz berdi. Qaytadan boshlang.")
+
+        try:
+            add_force_channel(channel_id, channel_link)
+            context.user_data["admin_mode"] = None
+            await update.message.reply_text(
+                f"✅ Majburiy kanal qo'shildi!\n\n"
+                f"📢 Kanal: {channel_id}\n"
+                f"🔗 Link: {channel_link}",
+                reply_markup=admin_panel_keyboard(),
+            )
+        except Exception as exc:
+            logger.error("Kanal qo'shishda xatolik: %s", exc)
+            await update.message.reply_text("❌ Kanal qo'shishda xatolik yuz berdi.")
+        return
+
+    if mode == "give_premium_id":
+        user_input = update.message.text.strip()
+        if not user_input:
+            return await update.message.reply_text("⚠️ ID yoki username kiriting.")
+        
+        # Try to extract user_id
+        target_user_id = None
+        if user_input.startswith("@"):
+            context.user_data["premium_target"] = user_input
+        else:
+            try:
+                target_user_id = int(user_input)
+                context.user_data["premium_target"] = target_user_id
+            except ValueError:
+                return await update.message.reply_text("⚠️ Noto'g'ri ID format. Raqam yoki @username kiriting.")
+        
+        context.user_data["admin_mode"] = "give_premium_months"
+        return await update.message.reply_text(
+            "📅 Necha oyga premium bermoqchisiz?\n\n"
+            "Masalan: 1, 3, 6, 12"
+        )
+
+    if mode == "give_premium_months":
+        try:
+            months = int(update.message.text.strip())
+            if months < 1 or months > 120:
+                return await update.message.reply_text("⚠️ 1 dan 120 oygacha kiriting.")
+        except ValueError:
+            return await update.message.reply_text("⚠️ Raqam kiriting.")
+        
+        target = context.user_data.get("premium_target")
+        if not target:
+            context.user_data["admin_mode"] = None
+            return await update.message.reply_text("⚠️ Xatolik yuz berdi. Qaytadan boshlang.")
+        
+        # If username, try to resolve it
+        if isinstance(target, str) and target.startswith("@"):
+            await update.message.reply_text(
+                f"⚠️ Username orqali qo'shish hozircha qo'llab-quvvatlanmaydi.\n"
+                f"Iltimos, foydalanuvchi ID'sini kiriting.\n\n"
+                f"User o'zini /start qilsa, ID ni olishingiz mumkin."
+            )
+            context.user_data["admin_mode"] = None
+            return
+        
+        try:
+            set_user_premium(target, months)
+            context.user_data["admin_mode"] = None
+            await update.message.reply_text(
+                f"✅ Premium berildi!\n\n"
+                f"🆔 User ID: {target}\n"
+                f"📅 Davomiyligi: {months} oy",
+                reply_markup=admin_panel_keyboard(),
+            )
+            
+            # Notify user
+            try:
+                await context.bot.send_message(
+                    target,
+                    f"🎉 Tabriklaymiz!\n\n"
+                    f"Sizga {months} oylik Premium obuna berildi!\n\n"
+                    f"💎 Endi siz majburiy kanallarga obuna bo'lmasdan kinolardan foydalanishingiz mumkin."
+                )
+            except:
+                pass
+                
+        except Exception as exc:
+            logger.error("Premium berishda xatolik: %s", exc)
+            await update.message.reply_text("❌ Premium berishda xatolik yuz berdi.")
+        return
+
+    if mode == "remove_premium_id":
+        user_input = update.message.text.strip()
+        if not user_input:
+            return await update.message.reply_text("⚠️ ID kiriting.")
+        
+        try:
+            target_user_id = int(user_input)
+        except ValueError:
+            return await update.message.reply_text("⚠️ Noto'g'ri ID format. Raqam kiriting.")
+        
+        try:
+            remove_user_premium(target_user_id)
+            context.user_data["admin_mode"] = None
+            await update.message.reply_text(
+                f"✅ Premium o'chirildi!\n\n"
+                f"🆔 User ID: {target_user_id}",
+                reply_markup=admin_panel_keyboard(),
+            )
+        except Exception as exc:
+            logger.error("Premium o'chirishda xatolik: %s", exc)
+            await update.message.reply_text("❌ Premium o'chirishda xatolik yuz berdi.")
+        return
+
     if mode == "broadcast":
         return await broadcast_message(update, context)
 
@@ -712,6 +1038,7 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_admin_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle media for broadcast only - file_id orqali qabul qilamiz"""
     user_id = update.effective_user.id
     if not is_admin(user_id):
         return
@@ -720,47 +1047,9 @@ async def handle_admin_media(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if mode == "broadcast":
         return await broadcast_message(update, context)
-
-    if mode != "add_file":
-        return
-
-    code = context.user_data.get("new_code")
-    desc = context.user_data.get("new_desc")
-    parent_code = context.user_data.get("new_parent")
-    if not code or not desc:
-        context.user_data["admin_mode"] = None
-        return await update.message.reply_text("⚠️ Xatolik yuz berdi. Qaytadan boshlang.")
-
-    content_type, file_id = extract_media(update)
-    if not content_type:
-        return await update.message.reply_text(
-            "⚠️ Faqat video, rasm yoki hujjat yuboring."
-        )
-
-    try:
-        add_movie(code, content_type, file_id, desc, parent_code)
-        context.user_data["admin_mode"] = None
-        await update.message.reply_text(
-            f"✅ Kino qo'shildi!\n\n"
-            f"🆔 Kod: {code}\n"
-            f"📝 Tavsif: {desc}\n"
-            f"📁 Turi: {content_type}",
-            reply_markup=admin_panel_keyboard(),
-        )
-    except Exception as exc:
-        logger.error("Kino qo'shishda xatolik: %s", exc)
-        await update.message.reply_text("❌ Kino qo'shishda xatolik yuz berdi.")
-
-
-def extract_media(update: Update):
-    msg = update.message
-    if msg.video:
-        return "video", msg.video.file_id
-    if msg.photo:
-        return "photo", msg.photo[-1].file_id
-    if msg.document:
-        return "document", msg.document.file_id
-    return None, None
+    
+    # Kino qo'shish uchun file_id matn sifatida yuborilishi kerak
+    return
 
 
 async def send_movie_by_code(chat_id, code, context: ContextTypes.DEFAULT_TYPE):
@@ -776,23 +1065,20 @@ async def send_movie_by_code(chat_id, code, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_movie_to_chat(chat_id, movie, code, context: ContextTypes.DEFAULT_TYPE):
-    caption = f"🆔 Kod: {code}\n📝 {movie['desc']}\n👁️ Ko'rishlar: {movie.get('views', 0) + 1}"
-    send_map = {
-        "video": context.bot.send_video,
-        "photo": context.bot.send_photo,
-        "document": context.bot.send_document,
-    }
+    name = movie.get('name') or movie.get('desc', 'Nom mavjud emas')
+    caption = (
+        f"🎬 {name}\n\n"
+        f"🆔 Kod: {code}\n"
+        f"📝 {movie.get('desc', '')}\n"
+        f"📥 Yuklab olingan: {movie.get('views', 0) + 1}\n\n"
+        f"@PrimeKin0Bot - 🎬 Eng zo'r kino va seriallar shu yerda"
+    )
+
     try:
-        if movie["type"] == "text":
-            text = f"{caption}\n\n{movie['file_id']}"
-            await context.bot.send_message(chat_id, text)
-            increment_views(code)
-            return
-        sender = send_map.get(movie["type"])
-        if not sender:
-            raise ValueError(f"Noma'lum kontent turi: {movie['type']}")
-        await sender(chat_id, movie["file_id"], caption=caption)
+        # Faqat video sifatida yuborish
+        await context.bot.send_video(chat_id, movie["file_id"], caption=caption)
         increment_views(code)
+
     except Exception as exc:
         logger.error("Kontentni yuborishda xatolik: %s", exc)
         await context.bot.send_message(
@@ -812,7 +1098,7 @@ async def handle_user_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not subscribed:
             context.user_data["pending_code"] = code
             await update.message.reply_text(
-                "📢 Kino olishdan oldin kanalga a'zo bo'ling.",
+                "📢 Kino olishdan oldin kanalga a'zo bo'ling yoki Premium sotib oling.",
                 reply_markup=force_sub_keyboard(),
             )
             return
@@ -823,11 +1109,12 @@ async def handle_user_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     children = get_children(code)
     if children:
-        text = "📺 Qismlar ro'yxati:\n\n"
+        text = "📺 Qismlar ro'yxati (eski → yangi):\n\n"
         for idx, item in enumerate(children, start=1):
-            text += f"{idx}. {item['desc']} | 👁️ {item['views']} - 🆔 {item['code']}\n"
+            name = item['name'] or item['desc']
+            text += f"{idx}. {name} | 👁️ {item['views']} - 🆔 {item['code']}\n"
             if idx == 9:
-                text += "\n📢 @multverseuz kanaliga obuna bo'ling.\n\n"
+                text += "\n📢 @primekin0 kanaliga obuna bo'ling.\n\n"
         await update.message.reply_text(
             text, reply_markup=numbered_keyboard(children)
         )
@@ -843,9 +1130,10 @@ async def random_movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = "🎲 Tasodifiy kinolar:\n\n"
     for idx, item in enumerate(rows, start=1):
-        text += f"{idx}. {item['desc']} | 👁️ {item['views']} - 🆔 {item['code']}\n"
+        name = item['name'] or item['desc']
+        text += f"{idx}. {name} | 👁️ {item['views']} - 🆔 {item['code']}\n"
         if idx == 9:
-            text += "\n📢 @multverseuz kanaliga obuna bo'ling.\n\n"
+            text += "\n📢 @primekin0 kanaliga obuna bo'ling.\n\n"
 
     await update.message.reply_text(
         text, reply_markup=numbered_keyboard(rows)
@@ -904,16 +1192,14 @@ async def handle_other_messages(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
-    if context.user_data.get("awaiting_admin_code"):
-        return await handle_admin_login(update, context)
     return await handle_admin_text(update, context)
 
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("❌ BOT_TOKEN .env faylida yo'q.")
-    if not ADMIN_CODE:
-        raise RuntimeError("❌ ADMIN_CODE .env faylida yo'q.")
+    if not ADMIN_IDS:
+        logger.warning("⚠️ ADMIN_IDS .env faylida yo'q. Hech kim admin bo'lmaydi!")
 
     init_db()
 
@@ -936,6 +1222,7 @@ def main():
     app.add_handler(MessageHandler(filters.ALL, handle_other_messages))
 
     logger.info("🚀 Bot ishga tushdi...")
+    logger.info(f"👥 Adminlar: {ADMIN_IDS}")
     app.run_polling()
 
 

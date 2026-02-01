@@ -1,6 +1,6 @@
 @echo off
 call env\Scripts\activate
 
-py bot.py
+py app.py
 
 pause
