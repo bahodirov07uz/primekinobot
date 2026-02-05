@@ -3,3 +3,5 @@ movies.json
 env
 .env
 bot.db
+kanal_a'zolar.db
+__pycache__

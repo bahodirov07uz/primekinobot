@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -49,7 +50,7 @@ def main() -> None:
 
     logger.info("🚀 Bot ishga tushdi...")
     logger.info("👥 Adminlar: %s", ADMIN_IDS)
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

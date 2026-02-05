@@ -37,6 +37,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    logger.info("Callback received: %s", query.data if query else "none")
     await query.answer()
     users.upsert_user(query.from_user)
     user_id = query.from_user.id
@@ -357,41 +358,13 @@ async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["new_parent"] = parent_code
         context.user_data["admin_mode"] = "add_file"
         await update.message.reply_text(
-            "📤 Endi video FILE_ID ni matn sifatida yuboring:\n\n"
-            "Masalan: BAACAgIAAxkBAAFBjGdpfaHOG3hd3yWFIPZ3-nhmkhZEHQAC2pkAArZd6EtLDMX_kNng_DgE"
+            "📤 Endi videoni (yoki hujjat ko'rinishidagi videoni) yuboring.\n\n"
+            "Bot file_id ni o'zi ajratib oladi."
         )
         return
 
     if mode == "add_file":
-        file_id_text = update.message.text.strip()
-        if not file_id_text:
-            await update.message.reply_text("⚠️ File_id bo'sh bo'lmasligi kerak.")
-            return
-
-        code = context.user_data.get("new_code")
-        name = context.user_data.get("new_name")
-        desc = context.user_data.get("new_desc")
-        parent_code = context.user_data.get("new_parent")
-
-        if not code or not name or not desc:
-            context.user_data["admin_mode"] = None
-            await update.message.reply_text("⚠️ Xatolik yuz berdi. Qaytadan boshlang.")
-            return
-
-        try:
-            movies.add_movie(code, name, "video", file_id_text, desc, parent_code)
-            context.user_data["admin_mode"] = None
-            await update.message.reply_text(
-                f"✅ Kino qo'shildi!\n\n"
-                f"🆔 Kod: {code}\n"
-                f"📝 Nom: {name}\n"
-                f"📄 Tavsif: {desc}\n"
-                f"📁 Turi: video",
-                reply_markup=admin_panel_keyboard(),
-            )
-        except Exception as exc:
-            logger.error("Kino qo'shishda xatolik: %s", exc)
-            await update.message.reply_text("❌ Kino qo'shishda xatolik yuz berdi.")
+        await update.message.reply_text("⚠️ Iltimos, video fayl yuboring.")
         return
 
     if mode == "delete":
@@ -603,6 +576,47 @@ async def handle_admin_media(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     mode = context.user_data.get("admin_mode")
+    if mode == "add_file":
+        message = update.message
+        file_id = None
+        content_type = None
+        if message.video:
+            file_id = message.video.file_id
+            content_type = "video"
+        elif message.document:
+            file_id = message.document.file_id
+            content_type = "document"
+
+        if not file_id or not content_type:
+            await update.message.reply_text("⚠️ Iltimos, video fayl yuboring.")
+            return
+
+        code = context.user_data.get("new_code")
+        name = context.user_data.get("new_name")
+        desc = context.user_data.get("new_desc")
+        parent_code = context.user_data.get("new_parent")
+
+        if not code or not name or not desc:
+            context.user_data["admin_mode"] = None
+            await update.message.reply_text("⚠️ Xatolik yuz berdi. Qaytadan boshlang.")
+            return
+
+        try:
+            movies.add_movie(code, name, content_type, file_id, desc, parent_code)
+            context.user_data["admin_mode"] = None
+            await update.message.reply_text(
+                f"✅ Kino qo'shildi!\n\n"
+                f"🆔 Kod: {code}\n"
+                f"📝 Nom: {name}\n"
+                f"📄 Tavsif: {desc}\n"
+                f"📁 Turi: {content_type}",
+                reply_markup=admin_panel_keyboard(),
+            )
+        except Exception as exc:
+            logger.error("Kino qo'shishda xatolik: %s", exc)
+            await update.message.reply_text("❌ Kino qo'shishda xatolik yuz berdi.")
+        return
+
     if mode == "broadcast":
         await broadcast_message(update, context)
         return
