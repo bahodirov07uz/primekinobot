@@ -6,7 +6,7 @@ from aiogram.types import ChatMemberUpdated
 from aiogram.filters.chat_member_updated import ChatMemberUpdatedFilter, JOIN_TRANSITION
 
 # --- SOZLAMALAR ---
-TOKEN = "8451159147:AAGM58p2h3Nr0kIzB0n9IrCivlCXfrNCTPk"
+TOKEN = ""
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
